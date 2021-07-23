@@ -1,3 +1,7 @@
+//Code for interfacing 16*2 LCD, Ultrasonic Sensor and Relay to MSP430 Lunchbox microcontroller
+
+//---------------------------------------------------------------------------------
+
 #include <msp430.h>
 #include <inttypes.h>
 #include <stdio.h>
