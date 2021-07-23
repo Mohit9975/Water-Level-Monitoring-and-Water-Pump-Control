@@ -1,0 +1,368 @@
+#include <msp430.h>
+#include <inttypes.h>
+#include <stdio.h>
+
+//---------------------------------------------------------------------------------
+
+// For LCD Display
+
+#define CMD         0
+#define DATA        1
+
+#define LCD_OUT     P1OUT
+#define LCD_DIR     P1DIR
+#define D4          BIT4
+#define D5          BIT5
+#define D6          BIT6
+#define D7          BIT7
+#define RS          BIT1
+#define EN          BIT3
+
+// For Ultrasonic Sensor
+
+#define TRIG_PIN    BIT1 // Corresponds to P2.1
+#define ECHO_PIN    BIT2 // Corresponds to P1.2
+
+// For Motor Control, Buzzer and LEDs
+
+#define BUZZER      BIT5 // Buzzer on Bit 5 of Port 2
+#define MOTOR       BIT4 // Motor Relay on Bit 4 of Port 2
+#define GREEN       BIT3 // Green LED for Motor ON on Bit 3 of Port 2
+#define RED         BIT2 // Red LED for Motor OFF on Bit 2 of Port 2
+
+// Variables for Computation
+
+volatile unsigned char count;
+volatile unsigned long Start_Echo, End_Echo, Period;  // Global variables
+volatile unsigned long Distance, Status=0;
+int Var=0;
+
+
+//----------------------------------------------------------------------------------
+
+// Delay Function t be used when necessary- Provides 0.1*t milli-seconds delay
+
+void delay(uint16_t t)
+{
+    uint16_t i;
+    for(i=t; i > 0; i--)
+        __delay_cycles(100);
+}
+
+// LCD Display Settings
+
+void pulseEN(void)
+{
+    LCD_OUT |= EN;
+    delay(1);
+    LCD_OUT &= ~EN;
+    delay(1);
+}
+
+
+/*
+ -Function to write data/command to LCD
+ -param value Value to be written to LED
+ -param mode Mode -> Command or Data
+ -return void
+ */
+void lcd_write(uint8_t value, uint8_t mode)
+{
+    if(mode == CMD)
+        LCD_OUT &= ~RS;             // Set RS -> LOW for Command mode
+    else
+        LCD_OUT |= RS;              // Set RS -> HIGH for Data mode
+
+    LCD_OUT = ((LCD_OUT & 0x0F) | (value & 0xF0));              // Write high nibble first
+    pulseEN();
+    delay(1);
+
+    LCD_OUT = ((LCD_OUT & 0x0F) | ((value << 4) & 0xF0));       // Write low nibble next
+    pulseEN();
+    delay(1);
+}
+
+/*
+ -Function to print a string on LCD
+ -param *s pointer to the character to be written.
+ -return void
+ */
+void lcd_print(char *s)
+{
+    while(*s)
+    {
+        lcd_write(*s, DATA);
+        s++;
+    }
+}
+
+/*
+ -Function to convert number into character array
+ -param num integer number to be converted.
+ -return void
+ */
+void lcd_printNumber(unsigned int num)
+{
+    char buf[6];
+    char *str = &buf[5];
+
+    *str = '\0';
+
+    do
+    {
+        unsigned long m = num;
+        num /= 10;
+        char c = (m - 10 * num) + '0';
+        *--str = c;
+    } while(num);
+
+    lcd_print(str);
+}
+
+/*
+ -Function to move cursor to desired position on LCD
+ -param row Row Cursor of the LCD
+ -param col Column Cursor of the LCD
+ -return void
+ */
+void lcd_setCursor(uint8_t row, uint8_t col)
+{
+    const uint8_t row_offsets[] = { 0x00, 0x40};
+    lcd_write(0x80 | (col + row_offsets[row]), CMD);
+    delay(1);
+}
+/*
+ Initialize LCD
+ */
+void lcd_init()
+{
+    LCD_DIR |= (D4+D5+D6+D7+RS+EN);
+    LCD_OUT &= ~(D4+D5+D6+D7+RS+EN);
+
+    delay(150);                     // Wait for power up ( 15ms )
+    lcd_write(0x33, CMD);           // Initialization Sequence 1
+    delay(50);                      // Wait ( 4.1 ms )
+    lcd_write(0x32, CMD);           // Initialization Sequence 2
+    delay(1);                       // Wait ( 100 us )
+
+    // All subsequent commands take 40 us to execute, except clear & cursor return (1.64 ms)
+
+    lcd_write(0x28, CMD);           // 4 bit mode, 2 line
+    delay(1);
+
+    lcd_write(0x0C, CMD);           // Display ON, Cursor OFF, Blink OFF
+    delay(1);
+
+    lcd_write(0x01, CMD);           // Clear screen
+    delay(20);
+
+    lcd_write(0x06, CMD);           // Auto Increment Cursor
+    delay(1);
+
+    lcd_setCursor(0,0);             // Goto Row 1 Column 1
+}
+
+/*
+ Displays on LCD
+ */
+void lcd_display()
+{
+    int int_part_Distance = Distance;                                   // Captured Distance
+    int Motor_Status= Status;                                           // Display Motor Status
+
+    lcd_write(0x01, CMD);                       // Clear screen
+    delay(20);
+    lcd_setCursor(0,1);
+    lcd_print("Distance: ");
+    lcd_printNumber(int_part_Distance);
+    //lcd_printNumber(decimal_part_Distance);
+    lcd_print("cm");
+    lcd_setCursor(1,1);
+    lcd_print("Motor ON1/OFF0:");
+    lcd_print(Motor_Status);
+    delay(10000);
+}
+
+//-----------------------------------------------------------------------------------------------------------------
+
+// Reset Timer everytime before the 10 micro-second trigger pulse is sent
+
+void reset_timer(void)
+
+{
+
+    //Clear timer
+
+    TACTL |= TACLR;
+
+}
+
+
+// Timer0 settings on MSP430 Lunchbox
+
+void register_settings_for_TIMER0()
+{
+    P1DIR &= ~BIT2;                                 // Set P1.2 -> Input
+    P1SEL |= BIT2;                                  // Set P1.2 -> TA0.1 Capture Mode
+
+    TA0CCTL1 = CAP + CM_3 + CCIE + SCS + CCIS_0;    // Capture Mode, Rising Edge and Falling Edge, Interrupt
+                                                    // Enable, Synchronize, Source -> CCI0A
+    TA0CTL |= TASSEL_2 + MC_2 + ID_0;               // Clock -> SMCLK, Cont. Mode, Clear Timer
+}
+
+//---------------------------------------------------------------------------------------------------------------------------------------------
+
+// Main Program
+
+void main(void)
+
+{
+    WDTCTL = WDTPW + WDTHOLD;                       //! Stop Watchdog
+
+    lcd_init();                                     // Initialize LCD
+
+    P2DIR |= TRIG_PIN;                              // Set P2.1 -> Output
+    P2OUT &= ~TRIG_PIN;                             // Set P2.1 -> Low
+
+    //Defining Bits for Motor Control, Buzzer and LEDs
+
+    P2DIR |= BUZZER;                                 // Set P2.5 -> Output
+    P2OUT &= ~BUZZER;                                // Set as Low Initially
+
+    P2DIR |= MOTOR;                                  // Set P2.5 -> Output
+    P2OUT &= ~MOTOR;                                 // Set as Low Initially
+
+    P2DIR |= GREEN;                                  // Set P2.5 -> Output
+    P2OUT &= ~GREEN;                                 // Set as Low Initially
+
+    P2DIR |= RED;                                    // Set P2.5 -> Output
+    P2OUT &= ~RED;                                    // Set as Low Initially
+
+    register_settings_for_TIMER0();                 //Initialize Timer0
+
+    // Send Ultrasonic Pulse on Pin2.1 to Ultrasonic Sensor Trigger
+
+    __enable_interrupt();
+
+
+    while(1)
+    {
+
+        lcd_display();                              // Display values on LCD in every loop (refreshing)
+
+
+
+        // Send Ultrasonic Pulse on Pin2.1 to Ultrasonic Sensor Trigger
+
+        reset_timer();
+
+        P2OUT |= TRIG_PIN;
+
+        // Send pulse for 10us
+
+        __delay_cycles(10);
+
+        // Disable TRIGGER
+
+        P2OUT &= ~TRIG_PIN;
+
+        // Wait for 500 ms before next cont
+
+        delay(1000);                                // 1000*0.1 ms
+
+        if(Distance <= 5)                           // Motor Needs to be turned ON
+        {
+            P2OUT |= MOTOR;                         // Start the Motor
+            P2OUT |= GREEN;                         // Turn ON Green LED as Motor Starts
+            P2OUT &= ~RED;                          // Turn OFF Red LED as Motor Starts
+            Status= 1;                              // LCD Display Status
+            // Buzzer Beep on Motor Turn ON
+
+            if (Var==0)
+            {
+                P2OUT |= BUZZER;                        // Turn Buzzer ON
+                delay(20000);                           // For 2 Seconds
+                P2OUT &= ~BUZZER;                       // And then turn the buzzer OFF
+                Var=1;
+            }
+        }
+
+        else
+        {
+            if (Distance <=25 && Distance>5)
+            {
+                __delay_cycles(1);
+                Var=0;
+            }
+            else
+            {
+                P2OUT &= ~MOTOR;                        // Start the Motor
+                P2OUT |= RED;                           // Turn ON Red LED as Motor Stops
+                P2OUT &= ~GREEN;                        // Turn OFF Green LED as Motor Stops
+                Status= 0;                              // LCD Display Status
+
+                // Buzzer Double Beep on Motor Turn OFF
+
+                if (Var==0)
+                {
+                    P2OUT |= BUZZER;                        // Turn Buzzer ON
+                    delay(10000);                           // For 1 Seconds
+                    P2OUT &= ~BUZZER;                       // And then turn the buzzer OFF
+                    delay(10000);                           // For 1 Seconds
+                    P2OUT |= BUZZER;                        // Turn Buzzer ON
+                    delay(10000);                           // For 1 Seconds
+                    P2OUT &= ~BUZZER;                       // And then turn the buzzer OFF
+                    Var=1;
+                }
+            }
+        }
+
+    }
+
+}
+
+
+#pragma vector = TIMER0_A1_VECTOR
+
+__interrupt void TA1_ISR(void)
+
+{
+
+    switch (TA0IV)
+
+    {
+
+    case  TA0IV_TACCR1:
+
+        // Read the CCI bit (ECHO signal) in CCTL0
+
+        // If ECHO is HIGH then start counting (rising edge)
+
+        if (CCTL1 & CCI)
+
+        {
+
+            Start_Echo = TA0CCR1;
+
+        } // If ECHO is LOW then stop counting (falling edge)
+
+        else
+
+        {
+
+            End_Echo = TA0CCR1;
+
+            Period = End_Echo - Start_Echo;
+
+            Distance = (0.01715*Period);
+
+
+        break;
+
+       }
+
+    TACTL &= ~CCIFG; // reset the interrupt flag
+
+    }
+
+}
